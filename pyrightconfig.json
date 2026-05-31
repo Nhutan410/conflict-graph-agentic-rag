@@ -1,0 +1,10 @@
+{
+  "venvPath": "/opt/anaconda3/envs",
+  "venv": "rese006",
+  "pythonVersion": "3.10",
+  "include": ["src", "data", "scripts", "tests"],
+  "exclude": ["conflict-graph-agentic-rag", "**/__pycache__", "**/node_modules", "**/.git", "**/.*"],
+  "typeCheckingMode": "basic",
+  "reportMissingImports": "warning",
+  "reportMissingModuleSource": "none"
+}

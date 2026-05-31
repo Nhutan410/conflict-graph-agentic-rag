@@ -1,0 +1,8 @@
+{
+  "python.defaultInterpreterPath": "/opt/anaconda3/envs/rese006/bin/python",
+  "python.terminal.activateEnvironment": true,
+  "pylance.analysis.typeCheckingMode": "basic",
+  "[python]": {
+    "editor.defaultFormatter": "ms-python.black-formatter"
+  }
+}

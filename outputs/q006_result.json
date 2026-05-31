@@ -1,0 +1,32 @@
+{
+  "query_id": "q_006",
+  "query": "When was the Dallas County Courthouse built?",
+  "resolved": false,
+  "iterations_run": 1,
+  "final_answer": "Insufficient evidence to answer this question reliably. The retrieved documents do not contain enough verified information.",
+  "n_validated_claims": 0,
+  "n_conflict_localizations": 2,
+  "conflict_localizations": [
+    {
+      "claim_i_id": "c_q006_d00_s01",
+      "claim_j_id": "c_q006_d04_s01",
+      "slot": "temporal",
+      "value_i": "1902",
+      "value_j": "1850",
+      "conflict_intensity": 0.75,
+      "credibility_i": 0.0,
+      "credibility_j": -1.9966894148226828
+    },
+    {
+      "claim_i_id": "c_q006_d00_s07",
+      "claim_j_id": "c_q006_d04_s01",
+      "slot": "temporal",
+      "value_i": "1848",
+      "value_j": "1850",
+      "conflict_intensity": 0.4,
+      "credibility_i": 0.0,
+      "credibility_j": -1.9966894148226828
+    }
+  ],
+  "validated_claims": []
+}

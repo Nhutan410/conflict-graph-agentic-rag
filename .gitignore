@@ -1,0 +1,15 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Environment secrets
+.env
+
+# Claude internal files
+CLAUDE/
+
+# Docs nội bộ (giữ lại PIPELINE_EXPLAINED.md và SCRIPTS_GUIDE.md)
+INTEGRATION_MASTER.md
