@@ -233,6 +233,30 @@ def read_claims_jsonl(path: str | Path) -> List[Claim]:
 
     return claims
 
+def filter_only_canonical_claims(claims: List[Claim]) -> List[Claim]:
+    """
+    Chỉ giữ các claim canonical, tức duplicate_of == None.
+
+    Với input factoid_claims_dedup_annotated.jsonl:
+    - duplicate_of = null  -> giữ lại để chạy NLI
+    - duplicate_of != null -> bỏ qua vì là duplicate của claim khác
+    """
+
+    before = len(claims)
+
+    kept = [
+        claim for claim in claims
+        if claim.duplicate_of is None
+    ]
+
+    removed = before - len(kept)
+
+    print(f"Canonical-only filtering enabled")
+    print(f"Claims before canonical filtering: {before}")
+    print(f"Claims kept where duplicate_of is null: {len(kept)}")
+    print(f"Duplicate claims removed before NLI: {removed}")
+
+    return kept
 
 def read_queries_jsonl(path: str | Path) -> Dict[str, QueryRecord]:
     """
@@ -1066,46 +1090,149 @@ def decide_relation_with_alignment(
     contradiction_prob: float,
     alignment: AlignmentFeatures,
     entailment_threshold: float = 0.70,
-    support_threshold: float = 0.6,
+    support_threshold: float = 0.60,
     contradiction_threshold: float = 0.60,
+    contradiction_a_to_b: Optional[float] = None,
+    contradiction_b_to_a: Optional[float] = None,
+    contradiction_directional_gap_threshold: float = 0.45,
+    weak_contradiction_threshold: float = 0.50,
 ) -> Tuple[str, float]:
+    """
+    Quyết định relation_type bằng cách kết hợp:
+    - NLI probabilities hai chiều
+    - alignment features
+    - directional contradiction balance
 
-    # 1. Khác factual target thì neutral trước
+    Ý tưởng chính:
+    1. Nếu khác factual target rõ ràng -> neutral.
+    2. Nếu contradiction cao nhưng chỉ cao ở một chiều -> không vội gán contradiction,
+       trừ khi có hard conflict signal từ alignment.
+    3. Entailment là directional: A -> B.
+    4. Support là symmetric entailment signal.
+    """
+
+    # ---------------------------------------------------------------------
+    # 1. Nếu hai claims không cùng factual target thì neutral trước.
+    # ---------------------------------------------------------------------
     if alignment.force_neutral:
         return "neutral", clamp01(max(neutral_prob, contradiction_prob))
 
-    # 2. Contradiction
+    # ---------------------------------------------------------------------
+    # 2. Tính contradiction directional gap nếu có đủ hai chiều.
+    # ---------------------------------------------------------------------
+    if contradiction_a_to_b is not None and contradiction_b_to_a is not None:
+        contradiction_directional_gap = abs(
+            contradiction_a_to_b - contradiction_b_to_a
+        )
+        contradiction_min = min(contradiction_a_to_b, contradiction_b_to_a)
+        contradiction_max = max(contradiction_a_to_b, contradiction_b_to_a)
+    else:
+        contradiction_directional_gap = 0.0
+        contradiction_min = contradiction_prob
+        contradiction_max = contradiction_prob
+
+    contradiction_is_imbalanced = (
+        contradiction_directional_gap >= contradiction_directional_gap_threshold
+    )
+
+    # ---------------------------------------------------------------------
+    # 3. Hard conflict signals từ alignment.
+    # ---------------------------------------------------------------------
+    has_hard_conflict_signal = (
+        alignment.negation_mismatch
+        or alignment.number_compatibility == 0.0
+    )
+
+    has_temporal_mismatch = (
+        alignment.temporal_overlap == 0.0
+    )
+
+    has_contextual_conflict_signal = has_temporal_mismatch
+
+    has_strong_event_alignment = (
+        alignment.event_alignment >= 0.50
+        and alignment.entity_overlap > 0.0
+    )
+
+    # ---------------------------------------------------------------------
+    # 4. Contradiction decision.
+    # ---------------------------------------------------------------------
     if contradiction_prob >= contradiction_threshold:
-        has_hard_conflict_signal = (
-            alignment.negation_mismatch
-            or alignment.number_compatibility == 0.0
-        )
 
-        has_contextual_mismatch = (
-            alignment.temporal_overlap == 0.0
-        )
+        # Case 4.1: Hai chiều contradiction tương đối cân bằng.
+        # Đây là contradiction đáng tin hơn.
+        if not contradiction_is_imbalanced:
+            if (
+                has_hard_conflict_signal
+                or has_contextual_conflict_signal
+                or has_strong_event_alignment
+            ):
+                return "contradiction", clamp01(contradiction_prob)
 
-        if has_hard_conflict_signal:
-            return "contradiction", clamp01(contradiction_prob)
+        # Case 4.2: Một chiều cao, một chiều thấp.
+        # Không nên gán contradiction chỉ vì max cao.
+        # Chỉ cho contradiction nếu có hard signal rõ ràng.
+        else:
+            if has_hard_conflict_signal:
+                confidence = min(
+                    contradiction_prob,
+                    0.5 * contradiction_prob + 0.5 * contradiction_min,
+                )
+                return "contradiction", clamp01(confidence)
 
-        if has_contextual_mismatch:
-            return "contradiction", clamp01(contradiction_prob)
+            # Temporal mismatch là contextual hơn là contradiction tuyệt đối.
+            # Nhưng schema hiện tại chưa bật contextual_conflict,
+            # nên tạm hạ confidence hoặc trả neutral.
+            if has_contextual_conflict_signal and contradiction_min >= weak_contradiction_threshold:
+                confidence = min(contradiction_prob, contradiction_min)
+                return "contradiction", clamp01(confidence)
 
-        if alignment.event_alignment >= 0.50:
-            return "contradiction", clamp01(contradiction_prob)
+            # Nếu chỉ có event alignment nhưng contradiction lệch mạnh,
+            # khả năng cao là model nhiễu ở một chiều.
+            return "neutral", clamp01(max(neutral_prob, 1.0 - contradiction_directional_gap))
 
-        return "neutral", clamp01(max(neutral_prob, contradiction_prob))
+        # Nếu contradiction cao nhưng không có alignment support đủ mạnh.
+        return "neutral", clamp01(max(neutral_prob, contradiction_prob * 0.5))
 
-    # 3. Entailment có hướng
+    # ---------------------------------------------------------------------
+    # 5. Entailment có hướng A -> B.
+    # ---------------------------------------------------------------------
     if entailment_a_to_b >= entailment_threshold:
         return "entailment", clamp01(entailment_a_to_b)
 
-    # 4. Support
+    # ---------------------------------------------------------------------
+    # 6. Support hai chiều.
+    # ---------------------------------------------------------------------
     if support_prob >= support_threshold:
         return "support", clamp01(support_prob)
 
+    # ---------------------------------------------------------------------
+    # 7. Default neutral.
+    # ---------------------------------------------------------------------
     return "neutral", clamp01(neutral_prob)
 
+def symmetric_contradiction_score(
+    contradiction_a_to_b: float,
+    contradiction_b_to_a: float,
+    imbalance_penalty: float = 0.35,
+) -> float:
+    """
+    Contradiction về mặt logic nên gần đối xứng.
+    Nếu chỉ một chiều cao, giảm score để tránh false contradiction.
+
+    Ví dụ:
+        0.05, 0.70 -> khoảng 0.39
+        0.70, 0.80 -> khoảng 0.80
+    """
+
+    max_c = max(contradiction_a_to_b, contradiction_b_to_a)
+    min_c = min(contradiction_a_to_b, contradiction_b_to_a)
+    avg_c = 0.5 * (contradiction_a_to_b + contradiction_b_to_a)
+
+    score = avg_c + imbalance_penalty * min_c
+    score = min(score, max_c)
+
+    return clamp01(score)
 
 # =============================================================================
 # NLI inference engine
@@ -1380,9 +1507,9 @@ class NLIInferencer:
         contradiction_a_to_b = ab["contradiction"]
         contradiction_b_to_a = ba["contradiction"]
 
-        contradiction_prob = max(
-            contradiction_a_to_b,
-            contradiction_b_to_a,
+        contradiction_prob = symmetric_contradiction_score(
+            contradiction_a_to_b=contradiction_a_to_b,
+            contradiction_b_to_a=contradiction_b_to_a,
         )
 
         neutral_prob = (neutral_a_to_b + neutral_b_to_a) / 2.0
@@ -1406,6 +1533,8 @@ class NLIInferencer:
             entailment_threshold=self.entailment_threshold,
             support_threshold=self.support_threshold,
             contradiction_threshold=self.contradiction_threshold,
+            contradiction_a_to_b=contradiction_a_to_b,
+            contradiction_b_to_a=contradiction_b_to_a,
         )
 
         return NLIEdge(
@@ -1502,6 +1631,15 @@ def main():
         "--include_duplicates",
         action="store_true",
         help="Không bỏ duplicate claims",
+    )
+
+    parser.add_argument(
+        "--only_canonical_claims",
+        action="store_true",
+        help=(
+            "Chỉ chạy pipeline NLI với claims có duplicate_of == null. "
+            "Dùng cho input factoid_claims_dedup_annotated.jsonl."
+        ),
     )
 
     parser.add_argument(
@@ -1617,6 +1755,13 @@ def main():
 
     args = parser.parse_args()
 
+    if args.only_canonical_claims and args.include_duplicates:
+        raise ValueError(
+            "Không thể dùng đồng thời --only_canonical_claims và --include_duplicates. "
+            "--only_canonical_claims nghĩa là chỉ giữ duplicate_of == null, "
+            "còn --include_duplicates nghĩa là giữ cả duplicate claims."
+        )
+
     job_start_dt = datetime.now()
     job_start_ts = time.perf_counter()
 
@@ -1627,6 +1772,9 @@ def main():
 
     claims = read_claims_jsonl(args.input)
     print(f"Loaded claims: {len(claims)}")
+
+    if args.only_canonical_claims:
+        claims = filter_only_canonical_claims(claims)
 
     if args.target_query_id is not None:
         target_qid = normalize_query_id(args.target_query_id)
