@@ -221,6 +221,12 @@ class ClusterFeatures(BaseModel):
     internal_consistency: UnitInterval
     avg_context_completeness: UnitInterval
 
+    # Number of distinct source documents supporting all canonical members
+    # represented by the claims in this cluster.
+    # For a canonical claim c, this counts docs from all raw claims whose
+    # canonical_claim_id / duplicate_of points to c.
+    num_distinct_canonical_member_docs: int = Field(default=0, ge=0)
+
 
 class Cluster(BaseModel):
     """Module 7, mục 9.1 — một stance/phía lập luận trong conflict region."""
@@ -257,6 +263,12 @@ class RegionFeatures(BaseModel):
     min_cluster_coverage: Optional[UnitInterval] = None
     cluster_coverage_gap: UnitInterval
     coverage_balance_score: UnitInterval
+
+    max_cluster_distinct_docs: Optional[int] = Field(default=None, ge=0)
+    min_cluster_distinct_docs: Optional[int] = Field(default=None, ge=0)
+    cluster_distinct_doc_gap: int = Field(default=0, ge=0)
+    distinct_doc_balance_score: UnitInterval = 1.0
+
     avg_context_completeness: UnitInterval
     missing_time_ratio: Optional[UnitInterval] = None
     missing_condition_ratio: Optional[UnitInterval] = None
@@ -453,6 +465,85 @@ def get_claim_doc_key(claim: Claim) -> Optional[str]:
     if claim.source_id:
         return str(claim.source_id)
     return None
+
+
+def build_canonical_member_doc_index(
+    claims: Dict[str, Claim],
+) -> Dict[str, Set[str]]:
+    """
+    Build canonical_claim_id -> distinct document keys for all raw/member claims.
+
+    This is useful when NLI/regions operate on canonical claims only but the
+    full annotated claims file still contains duplicate/member claims. For a
+    canonical claim cc_1, this index counts docs from:
+      - the canonical claim itself, and
+      - every duplicate/member claim whose canonical_claim_id or duplicate_of
+        points to cc_1.
+
+    If only a dedup-kept file is provided, the index still works but the count
+    naturally reflects only the retained canonical records.
+    """
+    index: Dict[str, Set[str]] = defaultdict(set)
+
+    for claim in claims.values():
+        doc_key = get_claim_doc_key(claim)
+        if doc_key is None:
+            continue
+
+        canonical_id = (
+            claim.canonical_claim_id
+            or claim.duplicate_of
+            or claim.claim_id
+        )
+
+        index[str(canonical_id)].add(doc_key)
+        index[claim.claim_id].add(doc_key)
+
+    return index
+
+
+def count_distinct_canonical_member_docs(
+    claim_ids: Iterable[str],
+    claims: Dict[str, Claim],
+    canonical_member_doc_index: Optional[Dict[str, Set[str]]] = None,
+) -> int:
+    """
+    Count distinct documents of all canonical members represented by claim_ids.
+
+    For each claim id in a cluster, we use the doc index of its canonical id.
+    This prevents under-counting when a canonical node represents several
+    duplicate raw claims from different documents.
+    """
+    if canonical_member_doc_index is None:
+        canonical_member_doc_index = build_canonical_member_doc_index(claims)
+
+    docs: Set[str] = set()
+
+    for cid in claim_ids:
+        claim = claims.get(cid)
+        canonical_id = None
+
+        if claim is not None:
+            canonical_id = claim.canonical_claim_id or claim.duplicate_of or claim.claim_id
+
+        keys_to_try = []
+        if canonical_id is not None:
+            keys_to_try.append(str(canonical_id))
+        keys_to_try.append(str(cid))
+
+        found = False
+        for key in keys_to_try:
+            indexed_docs = canonical_member_doc_index.get(key, set())
+            if indexed_docs:
+                docs.update(indexed_docs)
+                found = True
+
+        if not found and claim is not None:
+            doc_key = get_claim_doc_key(claim)
+            if doc_key is not None:
+                docs.add(doc_key)
+
+    return len(docs)
 
 
 def claims_have_distinct_docs(
@@ -776,6 +867,7 @@ def build_clusters_for_region(
     region_edge_ids: List[str],
     claims: Dict[str, Claim],
     edges: Dict[str, Edge],
+    canonical_member_doc_index: Optional[Dict[str, Set[str]]] = None,
 ) -> List[Cluster]:
     """
     Cluster construction theo rule stance-based có overlap:
@@ -917,6 +1009,7 @@ def build_clusters_for_region(
             region_edge_ids=region_edge_ids,
             claims=claims,
             edges=edges,
+            canonical_member_doc_index=canonical_member_doc_index,
         )
 
         summary = build_simple_cluster_summary(claim_ids, claims)
@@ -958,6 +1051,7 @@ def compute_cluster_features(
     region_edge_ids: List[str],
     claims: Dict[str, Claim],
     edges: Dict[str, Edge],
+    canonical_member_doc_index: Optional[Dict[str, Set[str]]] = None,
 ) -> ClusterFeatures:
     claim_set = set(claim_ids)
     n = len(claim_ids)
@@ -1005,6 +1099,12 @@ def compute_cluster_features(
 
     internal_consistency = clamp01(1.0 - contradiction_density)
 
+    num_distinct_docs = count_distinct_canonical_member_docs(
+        claim_ids=claim_ids,
+        claims=claims,
+        canonical_member_doc_index=canonical_member_doc_index,
+    )
+
     return ClusterFeatures(
         num_claims=n,
         avg_claim_confidence=clamp01(safe_mean(confidences, 0.0)),
@@ -1012,6 +1112,7 @@ def compute_cluster_features(
         support_density=clamp01(support_density),
         internal_consistency=clamp01(internal_consistency),
         avg_context_completeness=clamp01(safe_mean(contexts, 0.0)),
+        num_distinct_canonical_member_docs=num_distinct_docs,
     )
 
 
@@ -1033,6 +1134,10 @@ REGION_FEATURE_NAMES = [
     "min_cluster_coverage",
     "cluster_coverage_gap",
     "coverage_balance_score",
+    "max_cluster_distinct_docs_norm",
+    "min_cluster_distinct_docs_norm",
+    "cluster_distinct_doc_gap_norm",
+    "distinct_doc_balance_score",
     "avg_context_completeness",
     "missing_time_ratio",
     "missing_condition_ratio",
@@ -1105,6 +1210,35 @@ def compute_region_features(
 
     coverage_balance_score = clamp01(1.0 - cov_gap)
 
+    cluster_distinct_docs = [
+        c.cluster_features.num_distinct_canonical_member_docs
+        for c in clusters
+    ]
+
+    max_distinct_docs = safe_max([float(x) for x in cluster_distinct_docs], None)
+    min_distinct_docs = safe_min([float(x) for x in cluster_distinct_docs], None)
+
+    if max_distinct_docs is not None:
+        max_distinct_docs_int = int(max_distinct_docs)
+    else:
+        max_distinct_docs_int = None
+
+    if min_distinct_docs is not None:
+        min_distinct_docs_int = int(min_distinct_docs)
+    else:
+        min_distinct_docs_int = None
+
+    distinct_doc_gap = 0
+    if max_distinct_docs_int is not None and min_distinct_docs_int is not None:
+        distinct_doc_gap = max_distinct_docs_int - min_distinct_docs_int
+
+    # Balance is normalized by the stronger cluster's distinct-doc count.
+    # 1.0 = balanced, 0.0 = one side has all documents and the other has none.
+    if max_distinct_docs_int is not None and max_distinct_docs_int > 0:
+        distinct_doc_balance_score = clamp01(1.0 - (distinct_doc_gap / max_distinct_docs_int))
+    else:
+        distinct_doc_balance_score = 1.0
+
     context_values = [
         get_context_completeness(claims[cid])
         for cid in claim_set
@@ -1133,6 +1267,10 @@ def compute_region_features(
         min_cluster_coverage=min_cov,
         cluster_coverage_gap=cov_gap,
         coverage_balance_score=coverage_balance_score,
+        max_cluster_distinct_docs=max_distinct_docs_int,
+        min_cluster_distinct_docs=min_distinct_docs_int,
+        cluster_distinct_doc_gap=distinct_doc_gap,
+        distinct_doc_balance_score=distinct_doc_balance_score,
         avg_context_completeness=avg_context,
         missing_time_ratio=missing_time_ratio,
         missing_condition_ratio=missing_condition_ratio,
@@ -1231,6 +1369,9 @@ def region_features_to_vector(f: RegionFeatures) -> List[float]:
     num_edges_norm = min((f.num_edges or 0) / 50.0, 1.0)
     num_clusters_norm = min(f.num_claim_clusters / 10.0, 1.0)
     num_contra_norm = min((f.num_contradiction_edges or 0) / 20.0, 1.0)
+    max_distinct_docs_norm = min((f.max_cluster_distinct_docs or 0) / 20.0, 1.0)
+    min_distinct_docs_norm = min((f.min_cluster_distinct_docs or 0) / 20.0, 1.0)
+    distinct_doc_gap_norm = min(f.cluster_distinct_doc_gap / 20.0, 1.0)
 
     dominant_set = set(f.dominant_context_mismatch_type)
 
@@ -1248,6 +1389,10 @@ def region_features_to_vector(f: RegionFeatures) -> List[float]:
         f.min_cluster_coverage or 0.0,
         f.cluster_coverage_gap,
         f.coverage_balance_score,
+        max_distinct_docs_norm,
+        min_distinct_docs_norm,
+        distinct_doc_gap_norm,
+        f.distinct_doc_balance_score,
         f.avg_context_completeness,
         f.missing_time_ratio or 0.0,
         f.missing_condition_ratio or 0.0,
@@ -1415,17 +1560,22 @@ def heuristic_conflict_state(region_features: RegionFeatures) -> ConflictState:
     context_heavy = (
         region_features.avg_context_completeness < 0.55
         or (region_features.missing_time_ratio or 0.0) > 0.50
-        or (region_features.missing_condition_ratio or 0.0) > 0.50
+        # or (region_features.missing_condition_ratio or 0.0) > 0.50
         or ContextMismatchType.temporal in mismatch_set
         or ContextMismatchType.entity in mismatch_set
     )
 
+    
     if context_heavy:
         return ConflictState.contextual
 
     if (
         region_features.cluster_confidence_gap >= 0.25
         or region_features.cluster_coverage_gap >= 0.25
+        or (
+            region_features.cluster_distinct_doc_gap >= 1
+            and region_features.distinct_doc_balance_score <= 0.50
+        )
     ):
         return ConflictState.resolvable
 
@@ -1449,6 +1599,7 @@ def build_cluster_embedding(cluster: Cluster) -> EmbeddingVector:
         min(f.num_claims / 20.0, 1.0),
         f.avg_claim_confidence,
         f.cluster_evidence_coverage,
+        min(f.num_distinct_canonical_member_docs / 20.0, 1.0),
         f.support_density,
         f.internal_consistency,
         f.avg_context_completeness,
@@ -1568,6 +1719,7 @@ def run_pipeline(
     require_distinct_docs_per_region: bool = False,
 ) -> List[ConflictRegionRecord]:
     graph = build_claim_graph(claims=claims, edges=edges)
+    canonical_member_doc_index = build_canonical_member_doc_index(claims)
 
     detections = detect_conflict_regions(
         claims=claims,
@@ -1598,6 +1750,7 @@ def run_pipeline(
             region_edge_ids=region_edge_ids,
             claims=claims,
             edges=edges,
+            canonical_member_doc_index=canonical_member_doc_index,
         )
 
         region_features = compute_region_features(
