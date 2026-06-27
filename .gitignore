@@ -13,3 +13,14 @@ CLAUDE/
 
 # Docs nội bộ (giữ lại PIPELINE_EXPLAINED.md và SCRIPTS_GUIDE.md)
 INTEGRATION_MASTER.md
+
+# CodeGraph index
+.codegraph/
+
+# Data
+data/confict_rag/
+data/preprocessed_gpt-4o/
+
+# Pipeline outputs
+outputs/
+!outputs/.gitkeep
